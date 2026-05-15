@@ -80,6 +80,11 @@ struct ModelSession {
   Ort::AllocatorWithDefaultOptions allocator;
   Ort::SessionOptions options;
   Ort::Env env;
+  bool useVitisAI = false;
+  std::string vitisAICacheDir;
+  std::string vitisAICacheKey = "piper";
+  std::string vitisAIConfigFile;
+  int64_t vitisAIStaticPhonemes = 0;
 
   ModelSession() : onnx(nullptr){};
 };
@@ -117,6 +122,13 @@ void terminate(PiperConfig &config);
 void loadVoice(PiperConfig &config, std::string modelPath,
                std::string modelConfigPath, Voice &voice,
                std::optional<SpeakerId> &speakerId, bool useCuda);
+
+// Same as loadVoice, but keeps ONNX Runtime in-process with VitisAI provider.
+void loadVoiceVitisAI(PiperConfig &config, std::string modelPath,
+                      std::string modelConfigPath, Voice &voice,
+                      std::optional<SpeakerId> &speakerId,
+                      std::string cacheDir, std::string cacheKey,
+                      std::string configFile = "");
 
 // Phonemize text and synthesize audio
 void textToAudio(PiperConfig &config, Voice &voice, std::string text,

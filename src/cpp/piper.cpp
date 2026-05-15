@@ -1,9 +1,13 @@
 #include <array>
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 #include <espeak-ng/speak_lib.h>
 #include <onnxruntime_cxx_api.h>
@@ -31,6 +35,61 @@ const float MAX_WAV_VALUE = 32767.0f;
 const std::string instanceName{"piper"};
 
 std::string getVersion() { return VERSION; }
+
+int64_t envInt64(const char *name, int64_t fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !*raw) {
+    return fallback;
+  }
+  char *end = nullptr;
+  const long long parsed = std::strtoll(raw, &end, 10);
+  if (!end || *end != '\0' || parsed <= 0) {
+    return fallback;
+  }
+  return static_cast<int64_t>(parsed);
+}
+
+int64_t defaultVitisAIStaticPhonemes(const std::string &modelPath) {
+  return (modelPath.find("static256") != std::string::npos) ? 256 : 0;
+}
+
+bool isStaticVitisAIModel(const std::string &modelPath) {
+  return modelPath.find("static256") != std::string::npos;
+}
+
+void seedVitisAICacheDir(const std::string &cacheDir,
+                         const std::string &cacheKey,
+                         const std::string &modelPath) {
+  if (cacheDir.empty() || cacheKey.empty()) {
+    return;
+  }
+  std::error_code ec;
+  const auto modelCacheDir = std::filesystem::path(cacheDir) / cacheKey;
+  std::filesystem::create_directories(modelCacheDir, ec);
+  if (ec) {
+    return;
+  }
+
+  // VAIML expects these files to exist when compiling into an empty cache.
+  // The static Piper graph must keep /Mul_6 on CPU; otherwise VAIML overclaims
+  // one 100% subgraph and then fails AIE kernel selection on scalar-vs-rank-1
+  // bf16 operands. Non-static models keep the default "no extra exclusions".
+  const std::string unsupportedOps =
+      isStaticVitisAIModel(modelPath) ? "[\"/Mul_6\"]\n" : "[]\n";
+  const std::array<const char *, 2> seedFiles{
+      "aie_unsupported_original_ops.json",
+      "aie_unsupported_original_ops_with_reasons.json"};
+  for (const char *name : seedFiles) {
+    const auto path = modelCacheDir / name;
+    if (std::filesystem::exists(path, ec)) {
+      continue;
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (out.is_open()) {
+      out << unsupportedOps;
+    }
+  }
+}
 
 // True if the string is a single UTF-8 codepoint
 bool isSingleCodepoint(std::string s) {
@@ -265,7 +324,30 @@ void loadModel(std::string modelPath, ModelSession &session, bool useCuda) {
                          instanceName.c_str());
   session.env.DisableTelemetryEvents();
 
-  if (useCuda) {
+  if (session.useVitisAI) {
+    session.vitisAIStaticPhonemes =
+        envInt64("GG_F152_PIPER_VITISAI_STATIC_PHONEMES",
+                 defaultVitisAIStaticPhonemes(modelPath));
+    if (session.vitisAIStaticPhonemes > 0 && !isStaticVitisAIModel(modelPath)) {
+      Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(
+          session.options, "batch_size", 1));
+      Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(
+          session.options, "phonemes", session.vitisAIStaticPhonemes));
+    }
+    seedVitisAICacheDir(session.vitisAICacheDir, session.vitisAICacheKey,
+                        modelPath);
+    std::unordered_map<std::string, std::string> vaiOptions{
+        {"cache_dir", session.vitisAICacheDir},
+        {"cache_key", session.vitisAICacheKey},
+        {"cacheDir", session.vitisAICacheDir},
+        {"cacheKey", session.vitisAICacheKey},
+        {"log_level", "warning"},
+    };
+    if (!session.vitisAIConfigFile.empty()) {
+      vaiOptions["config_file"] = session.vitisAIConfigFile;
+    }
+    session.options.AppendExecutionProvider_VitisAI(vaiOptions);
+  } else if (useCuda) {
     // Use CUDA provider
     OrtCUDAProviderOptions cuda_options{};
     cuda_options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
@@ -280,7 +362,9 @@ void loadModel(std::string modelPath, ModelSession &session, bool useCuda) {
   //     GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
   session.options.SetGraphOptimizationLevel(
-      GraphOptimizationLevel::ORT_DISABLE_ALL);
+      (session.useVitisAI && session.vitisAIStaticPhonemes > 0)
+          ? GraphOptimizationLevel::ORT_ENABLE_EXTENDED
+          : GraphOptimizationLevel::ORT_DISABLE_ALL);
 
   // Slows down performance very slightly
   // session.options.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
@@ -333,6 +417,19 @@ void loadVoice(PiperConfig &config, std::string modelPath,
 
 } /* loadVoice */
 
+void loadVoiceVitisAI(PiperConfig &config, std::string modelPath,
+                      std::string modelConfigPath, Voice &voice,
+                      std::optional<SpeakerId> &speakerId,
+                      std::string cacheDir, std::string cacheKey,
+                      std::string configFile) {
+  voice.session.useVitisAI = true;
+  voice.session.vitisAICacheDir = std::move(cacheDir);
+  voice.session.vitisAICacheKey = std::move(cacheKey);
+  voice.session.vitisAIConfigFile = std::move(configFile);
+  loadVoice(config, std::move(modelPath), std::move(modelConfigPath), voice,
+            speakerId, false);
+}
+
 // Phoneme ids to WAV audio
 void synthesize(std::vector<PhonemeId> &phonemeIds,
                 SynthesisConfig &synthesisConfig, ModelSession &session,
@@ -342,16 +439,33 @@ void synthesize(std::vector<PhonemeId> &phonemeIds,
   auto memoryInfo = Ort::MemoryInfo::CreateCpu(
       OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
 
-  // Allocate
-  std::vector<int64_t> phonemeIdLengths{(int64_t)phonemeIds.size()};
+  // Allocate. VitisAI gets a fixed bucket so the compiler can avoid treating
+  // the phoneme axis as fully dynamic; input_lengths keeps real text length.
+  const int64_t realPhonemeCount = static_cast<int64_t>(phonemeIds.size());
+  std::vector<int64_t> phonemeIdLengths{realPhonemeCount};
+  std::vector<PhonemeId> paddedPhonemeIds;
+  PhonemeId *phonemeData = phonemeIds.data();
+  std::size_t phonemeDataCount = phonemeIds.size();
+  int64_t phonemeShapeCount = realPhonemeCount;
+  if (session.useVitisAI && session.vitisAIStaticPhonemes > 0) {
+    if (realPhonemeCount > session.vitisAIStaticPhonemes) {
+      throw std::runtime_error("Piper VitisAI phoneme count exceeds static bucket");
+    }
+    paddedPhonemeIds.assign(static_cast<std::size_t>(session.vitisAIStaticPhonemes),
+                            0);
+    std::copy(phonemeIds.begin(), phonemeIds.end(), paddedPhonemeIds.begin());
+    phonemeData = paddedPhonemeIds.data();
+    phonemeDataCount = paddedPhonemeIds.size();
+    phonemeShapeCount = session.vitisAIStaticPhonemes;
+  }
   std::vector<float> scales{synthesisConfig.noiseScale,
                             synthesisConfig.lengthScale,
                             synthesisConfig.noiseW};
 
   std::vector<Ort::Value> inputTensors;
-  std::vector<int64_t> phonemeIdsShape{1, (int64_t)phonemeIds.size()};
+  std::vector<int64_t> phonemeIdsShape{1, phonemeShapeCount};
   inputTensors.push_back(Ort::Value::CreateTensor<int64_t>(
-      memoryInfo, phonemeIds.data(), phonemeIds.size(), phonemeIdsShape.data(),
+      memoryInfo, phonemeData, phonemeDataCount, phonemeIdsShape.data(),
       phonemeIdsShape.size()));
 
   std::vector<int64_t> phomemeIdLengthsShape{(int64_t)phonemeIdLengths.size()};
