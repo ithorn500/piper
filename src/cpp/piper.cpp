@@ -346,12 +346,23 @@ void loadModel(std::string modelPath, ModelSession &session, bool useCuda) {
     if (!session.vitisAIConfigFile.empty()) {
       vaiOptions["config_file"] = session.vitisAIConfigFile;
     }
+    session.options.SetIntraOpNumThreads(
+        static_cast<int>(envInt64("GG_F152_PIPER_ORT_INTRA_OP_THREADS", 1)));
+    session.options.SetInterOpNumThreads(
+        static_cast<int>(envInt64("GG_F152_PIPER_ORT_INTER_OP_THREADS", 1)));
     session.options.AppendExecutionProvider_VitisAI(vaiOptions);
   } else if (useCuda) {
     // Use CUDA provider
     OrtCUDAProviderOptions cuda_options{};
     cuda_options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
     session.options.AppendExecutionProvider_CUDA(cuda_options);
+  } else {
+    session.options.SetIntraOpNumThreads(static_cast<int>(
+        envInt64("GG_F152_PIPER_CPU_ORT_INTRA_OP_THREADS",
+                 envInt64("GG_F152_PIPER_ORT_INTRA_OP_THREADS", 4))));
+    session.options.SetInterOpNumThreads(static_cast<int>(
+        envInt64("GG_F152_PIPER_CPU_ORT_INTER_OP_THREADS",
+                 envInt64("GG_F152_PIPER_ORT_INTER_OP_THREADS", 1))));
   }
 
   // Slows down performance by ~2x
@@ -362,15 +373,19 @@ void loadModel(std::string modelPath, ModelSession &session, bool useCuda) {
   //     GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
   session.options.SetGraphOptimizationLevel(
-      (session.useVitisAI && session.vitisAIStaticPhonemes > 0)
-          ? GraphOptimizationLevel::ORT_ENABLE_EXTENDED
-          : GraphOptimizationLevel::ORT_DISABLE_ALL);
+      session.useVitisAI
+          ? ((session.vitisAIStaticPhonemes > 0)
+                 ? GraphOptimizationLevel::ORT_ENABLE_EXTENDED
+                 : GraphOptimizationLevel::ORT_DISABLE_ALL)
+          : GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
   // Slows down performance very slightly
   // session.options.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
 
-  session.options.DisableCpuMemArena();
-  session.options.DisableMemPattern();
+  if (session.useVitisAI) {
+    session.options.DisableCpuMemArena();
+    session.options.DisableMemPattern();
+  }
   session.options.DisableProfiling();
 
   auto startTime = std::chrono::steady_clock::now();
